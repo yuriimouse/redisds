@@ -18,11 +18,33 @@
 #define REDIS_IS_STRING(x) (x && (REDIS_REPLY_STRING == x->type))
 #define REDIS_IS_ARRAY(x) (x && (REDIS_REPLY_ARRAY == x->type))
 
+typedef struct redis_dataspace
+{
+    char *name;
+    int base;
+    char *prefix;
+    struct redisContext *context;
+    struct redis_dataspace *next;
+} redis_dataspace;
+
 //
 static redis_server _redis_server_ = {NULL, 0, NULL, 0};
+static redis_dataspace *_redis_ds_list = NULL;
+
 static pthread_mutex_t redis_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static char *aprint(char *format, va_list ap);
+static char *aprint(char *format, va_list ap)
+{
+    char *buff = NULL;
+    vasprintf(&buff, format, ap);
+    return buff;
+}
+
+static redis_dataspace *redisDS_object(char *name, int base, char *prefix);
+static redis_dataspace *redisDS_free(redis_dataspace *dataspace);
+static redis_dataspace *redisDS_object(char *name, int base, char *prefix);
+static redis_dataspace *redisDS_get(char *name);
+
 static char *redis_type(redis_dataspace *dataspace, char *key);
 static cJSON *redis_string(redis_dataspace *dataspace, char *key);
 static cJSON *redis_hash(redis_dataspace *dataspace, char *key);
@@ -50,7 +72,7 @@ static redisReply *redis_vcommand(redis_dataspace *dataspace, char *format, va_l
  */
 int redisDS_serverOpen(char *host, int port, char *auth, int timeout)
 {
-    if (!_redis_server_.host)
+    if (!_redis_server_.host && !_redis_ds_list)
     {
         if (host && port)
         {
@@ -66,7 +88,29 @@ int redisDS_serverOpen(char *host, int port, char *auth, int timeout)
 }
 
 /**
+ * Cleans up and destroys a dataspace object
+ *
+ * @param dataspace
+ * @return redis_dataspace* next member
+ */
+static redis_dataspace *redisDS_free(redis_dataspace *dataspace)
+{
+    redis_dataspace *next = NULL;
+    if (dataspace)
+    {
+        next = dataspace->next;
+        FREE_AND_NULL(dataspace->name);
+        dataspace->base = 0;
+        FREE_AND_NULL(dataspace->prefix);
+        dataspace->context = NULL;
+        free(dataspace);
+    }
+    return next;
+}
+
+/**
  * Reset server options
+ * and free dataset collection
  *
  */
 void redisDS_serverClose()
@@ -75,53 +119,83 @@ void redisDS_serverClose()
     _redis_server_.port = 0;
     FREE_AND_NULL(_redis_server_.auth);
     _redis_server_.timeout = 0;
+
+    for (redis_dataspace *ptr = _redis_ds_list; ptr; ptr = redisDS_free(ptr))
+    {
+        redis_disconnect(ptr->context);
+    }
 }
 
 /**
  * Creates a dataspace object
  *
+ * @param name
  * @param base
  * @param prefix
  * @return redis_dataspace*
  */
-redis_dataspace *redisDS_object(int base, char *prefix)
+static redis_dataspace *redisDS_object(char *name, int base, char *prefix)
 {
     redis_dataspace *dataspace = malloc(sizeof(redis_dataspace));
     if (dataspace)
     {
+        dataspace->name = strdup(name);
+        dataspace->prefix = prefix;
         dataspace->base = base;
-        dataspace->prefix = prefix ? strdup(prefix) : NULL;
         dataspace->context = NULL;
+        dataspace->next = NULL;
         return dataspace;
     }
-    errno = ENOMEM;
     return NULL;
 }
 
 /**
- * Cleans up and destroys a dataspace object
+ * Registers a dataspace in a collection
  *
- * @param dataspace
- * @return redis_dataspace*
+ * @param name
+ * @param base
+ * @param prefix
+ * @param ...
+ * @return int*
  */
-redis_dataspace *redisDS_free(redis_dataspace *dataspace)
+int redisDS_register(char *name, int base, char *prefix, ...)
 {
-    if (dataspace)
+    if (name && name[0])
     {
-        dataspace->base = 0;
-        FREE_AND_NULL(dataspace->prefix);
-        redis_disconnect(dataspace->context);
-        dataspace->context = NULL;
-        free(dataspace);
+        va_list ap;
+        va_start(ap, prefix);
+        redis_dataspace *object = redisDS_object(name, base, prefix ? aprint(prefix, ap) : NULL);
+        va_end(ap);
+
+        if (object)
+        {
+            object->next = _redis_ds_list;
+            _redis_ds_list = object;
+            return 1;
+        }
+        errno = ENOMEM;
+        return 0;
     }
-    return NULL;
+    errno = EINVAL;
+    return 0;
 }
 
-static char *aprint(char *format, va_list ap)
+/**
+ * Gets the dataspace by name
+ *
+ * @param name
+ * @return redis_dataspace*
+ */
+static redis_dataspace *redisDS_get(char *name)
 {
-    char *buff = NULL;
-    vasprintf(&buff, format, ap);
-    return buff;
+    for (redis_dataspace *ptr = _redis_ds_list; ptr; ptr = ptr->next)
+    {
+        if (!strcmp(name, ptr->name))
+        {
+            return ptr;
+        }
+    }
+    return 0;
 }
 
 /**
@@ -211,6 +285,13 @@ static cJSON *redis_list(redis_dataspace *dataspace, char *key)
     return json;
 }
 
+/**
+ *
+ *
+ * @param dataspace
+ * @param key
+ * @return cJSON*
+ */
 static cJSON *redis_set(redis_dataspace *dataspace, char *key)
 {
     cJSON *json = NULL;
@@ -232,74 +313,50 @@ static cJSON *redis_set(redis_dataspace *dataspace, char *key)
 /**
  * Reads the key value from the dataspace
  *
- * @param dataspace
+ * @param name
  * @param key
  * @param ...
  * @return cJSON*
  */
-cJSON *redisDS_read(redis_dataspace *dataspace, char *key, ...)
+cJSON *redisDS_read(char *name, char *key, ...)
 {
-    cJSON *json = NULL;
-
-    va_list ap;
-    va_start(ap, key);
-    char *fullkey = aprint(key, ap);
-    va_end(ap);
-
-    char *type = redis_type(dataspace, fullkey);
-    if (type)
+    redis_dataspace *dataspace = redisDS_get(name);
+    if (dataspace)
     {
-        if (stringEQUALS(type, "string"))
+        cJSON *json = NULL;
+
+        va_list ap;
+        va_start(ap, key);
+        char *fullkey = aprint(key, ap);
+        va_end(ap);
+
+        char *type = redis_type(dataspace, fullkey);
+        if (type)
         {
-            json = redis_string(dataspace, fullkey);
+            if (stringEQUALS(type, "string"))
+            {
+                json = redis_string(dataspace, fullkey);
+            }
+            else if (stringEQUALS(type, "hash"))
+            {
+                json = redis_hash(dataspace, fullkey);
+            }
+            else if (stringEQUALS(type, "list"))
+            {
+                json = redis_list(dataspace, fullkey);
+            }
+            else if (stringEQUALS(type, "set"))
+            {
+                json = redis_set(dataspace, fullkey);
+            }
         }
-        else if (stringEQUALS(type, "hash"))
-        {
-            json = redis_hash(dataspace, fullkey);
-        }
-        else if (stringEQUALS(type, "list"))
-        {
-            json = redis_list(dataspace, fullkey);
-        }
-        else if (stringEQUALS(type, "set"))
-        {
-            json = redis_set(dataspace, fullkey);
-        }
+        FREE_AND_NULL(type);
+        FREE_AND_NULL(fullkey);
+
+        return json;
     }
-    FREE_AND_NULL(type);
-    FREE_AND_NULL(fullkey);
-
-    return json;
-}
-
-/**
- * Sets the value of the scalar key in the dataspace
- * and set key to timeout after a given number of seconds.
- * If key already holds a value, it is overwritten, regardless of its type.
- *
- * @param dataspace
- * @param key
- * @param value
- * @param ttl
- * @param ...
- * @return long long = ttl value
- */
-long long redisDS_set(redis_dataspace *dataspace, char *key, char *value, long long ttl, ...)
-{
-    va_list ap;
-    va_start(ap, ttl);
-    char *fullkey = aprint(key, ap);
-    char *fullval = aprint(value, ap);
-    va_end(ap);
-
-    redisReply *reply = redis_command(dataspace, "SET %s %s EX %lld", fullkey, fullval, ttl);
-    int ret = REDIS_IS_OK(reply);
-    freeReplyObject(reply);
-
-    FREE_AND_NULL(fullval);
-    FREE_AND_NULL(fullkey);
-
-    return ret ? ttl : 0;
+    errno = EINVAL;
+    return NULL;
 }
 
 static long long redis_ttl(redis_dataspace *dataspace, char *key)
@@ -318,11 +375,56 @@ static long long redis_ttl(redis_dataspace *dataspace, char *key)
 
 static long long redis_expire(redis_dataspace *dataspace, char *key, long long expire)
 {
-    redisReply *reply = redis_command(dataspace, "EXPIRE %s %lld", key, expire);
-    int ret = REDIS_IS_OK(reply);
-    freeReplyObject(reply);
+    long long oldttl = redis_ttl(dataspace, key);
+    int ret = 0;
+    if (oldttl <= 0)
+    {
+        redisReply *reply = redis_command(dataspace, "EXPIRE %s %lld", key, expire);
+        ret = REDIS_IS_OK(reply);
+        freeReplyObject(reply);
+    }
 
-    return ret ? expire : 0;
+    return ret ? expire : oldttl;
+}
+
+/**
+ * Sets the value of the scalar key in the dataspace
+ * and set key to timeout after a given number of seconds.
+ * If key already holds a value, it is overwritten, regardless of its type.
+ *
+ * @param dataspace
+ * @param key
+ * @param value
+ * @param ttl
+ * @param ...
+ * @return long long = ttl value
+ */
+long long redisDS_set(char *name, char *key, char *value, long long ttl, ...)
+{
+    redis_dataspace *dataspace = redisDS_get(name);
+    if (dataspace)
+    {
+        va_list ap;
+        va_start(ap, ttl);
+        char *fullkey = aprint(key, ap);
+        char *fullval = aprint(value, ap);
+        va_end(ap);
+
+        long long newttl = 0;
+        redisReply *reply = redis_command(dataspace, "SET %s %s EX %lld", fullkey, fullval, ttl);
+        if (REDIS_IS_OK(reply))
+        {
+            newttl = redis_expire(dataspace, fullkey, ttl);
+        }
+        freeReplyObject(reply);
+
+        FREE_AND_NULL(fullval);
+        FREE_AND_NULL(fullkey);
+
+        return newttl;
+    }
+    errno = EINVAL;
+    return 0;
 }
 
 /**
@@ -335,37 +437,39 @@ static long long redis_expire(redis_dataspace *dataspace, char *key, long long e
  * @param ...
  * @return long long
  */
-long long redisDS_append(redis_dataspace *dataspace, char *key, char *value, long long ttl, ...)
+long long redisDS_append(char *name, char *key, char *value, long long ttl, ...)
 {
-    long long count = 0;
-
-    va_list ap;
-    va_start(ap, ttl);
-    char *fullkey = aprint(key, ap);
-    char *fullval = aprint(value, ap);
-    va_end(ap);
-
-    redisReply *reply = redis_command(dataspace, "SADD %s %s", fullkey, fullval);
-    if (REDIS_IS_OK(reply))
+    redis_dataspace *dataspace = redisDS_get(name);
+    if (dataspace)
     {
-        long long oldttl = redis_ttl(dataspace, fullkey);
-        if (oldttl <= 0)
+        long long count = 0;
+
+        va_list ap;
+        va_start(ap, ttl);
+        char *fullkey = aprint(key, ap);
+        char *fullval = aprint(value, ap);
+        va_end(ap);
+
+        redisReply *reply = redis_command(dataspace, "SADD %s %s", fullkey, fullval);
+        if (REDIS_IS_OK(reply))
         {
-            redis_expire(dataspace, key, ttl);
+            redis_expire(dataspace, fullkey, ttl);
         }
+        freeReplyObject(reply);
+
+        reply = redis_command(dataspace, "SCARD %s", fullkey);
+        if (REDIS_IS_INT(reply))
+        {
+            count = reply->integer;
+        }
+
+        FREE_AND_NULL(fullval);
+        FREE_AND_NULL(fullkey);
+
+        return count;
     }
-    freeReplyObject(reply);
-
-    reply = redis_command(dataspace, "SCARD %s", fullkey);
-    if (REDIS_IS_INT(reply))
-    {
-        count = reply->integer;
-    }
-
-    FREE_AND_NULL(fullval);
-    FREE_AND_NULL(fullkey);
-
-    return count;
+    errno = EINVAL;
+    return 0;
 }
 
 /**
@@ -378,7 +482,45 @@ long long redisDS_append(redis_dataspace *dataspace, char *key, char *value, lon
  * @param ...
  * @return long long
  */
-long long redisDS_increment(redis_dataspace *dataspace, char *key, int value, long long ttl, ...)
+long long redisDS_increment(char *name, char *key, int value, long long ttl, ...)
+{
+    redis_dataspace *dataspace = redisDS_get(name);
+    if (dataspace)
+    {
+        long long count = 0;
+
+        va_list ap;
+        va_start(ap, ttl);
+        char *fullkey = aprint(key, ap);
+        va_end(ap);
+
+        redisReply *reply = redis_command(dataspace, "INCRBY %s %d", fullkey, value);
+        if (REDIS_IS_OK(reply) && REDIS_IS_INT(reply))
+        {
+            count = reply->integer;
+            redis_expire(dataspace, fullkey, ttl);
+        }
+        freeReplyObject(reply);
+
+        FREE_AND_NULL(fullkey);
+
+        return count;
+    }
+    errno = EINVAL;
+    return 0;
+}
+
+/**
+ * !!! FOR TESTING ONLY !!!
+ *
+ * @param dataspace
+ * @param key
+ * @param value
+ * @param ttl
+ * @param ...
+ * @return long long
+ */
+static long long redisDS_write(redis_dataspace *dataspace, char *key, cJSON *value, long long ttl, ...)
 {
     long long count = 0;
 
@@ -387,21 +529,84 @@ long long redisDS_increment(redis_dataspace *dataspace, char *key, int value, lo
     char *fullkey = aprint(key, ap);
     va_end(ap);
 
-    redisReply *reply = redis_command(dataspace, "INCRBY %s %d", fullkey, value);
-    if (REDIS_IS_OK(reply) && REDIS_IS_INT(reply))
+    redisReply *reply = NULL;
+    cJSON *element = NULL;
+    if (value)
     {
-        count = reply->integer;
-        long long oldttl = redis_ttl(dataspace, fullkey);
-        if (oldttl <= 0)
+        switch (value->type)
         {
-            redis_expire(dataspace, key, ttl);
+        case cJSON_String:
+            reply = redis_command(dataspace, "SET %s %s", fullkey, value->valuestring);
+            if (REDIS_IS_OK(reply))
+            {
+                count++;
+                redis_expire(dataspace, fullkey, ttl);
+            }
+            break;
+        case cJSON_Array:
+            cJSON_ArrayForEach(element, value)
+            {
+                reply = redis_command(dataspace, "SADD %s %s", fullkey, value->valuestring);
+                if (!REDIS_IS_OK(reply))
+                {
+                    break;
+                }
+                count++;
+            }
+            if (REDIS_IS_OK(reply))
+            {
+                redis_expire(dataspace, fullkey, ttl);
+            }
+            break;
+        case cJSON_Object:
+            cJSON_ArrayForEach(element, value)
+            {
+                reply = redis_command(dataspace, "HSET %s %s %s", fullkey, value->string, value->valuestring);
+                if (!REDIS_IS_OK(reply))
+                {
+                    break;
+                }
+                count++;
+            }
+            if (REDIS_IS_OK(reply))
+            {
+                redis_expire(dataspace, fullkey, ttl);
+            }
+            break;
         }
     }
     freeReplyObject(reply);
-
     FREE_AND_NULL(fullkey);
 
     return count;
+}
+
+/**
+ * !!! FOR TESTING ONLY !!!
+ *
+ * @param dataspace
+ * @param object
+ * @param ttl
+ * @param ...
+ * @return long long
+ */
+long long redisDS_store(char *name, cJSON *object, long long ttl)
+{
+    redis_dataspace *dataspace = redisDS_get(name);
+    if (dataspace)
+    {
+        long long count = 0;
+
+        cJSON *element = NULL;
+        cJSON_ArrayForEach(element, object)
+        {
+            count += redisDS_write(dataspace, "%s", element, ttl, element->string);
+        }
+
+        return count;
+    }
+    errno = EINVAL;
+    return 0;
 }
 
 /**

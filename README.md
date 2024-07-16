@@ -1,2 +1,2 @@
 # redisds
-Redis dataspaces manipulations
+Manipulations with Redis dataspaces
