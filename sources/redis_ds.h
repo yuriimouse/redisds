@@ -14,6 +14,13 @@
 #define VERSION "0"
 #endif
 
+#define FREE_AND_NULL(x) \
+    if (x)               \
+    {                    \
+        free(x);         \
+        x = NULL;        \
+    }
+
 typedef struct redis_server
 {
     char *host;

@@ -3,12 +3,13 @@
 #include <hiredis/hiredis.h>
 #include <pthread.h>
 #include <sys/time.h>
+#include <syslog.h>
 
-#define FREE_AND_NULL(x) \
-    if (x)               \
-    {                    \
-        free(x);         \
-        x = NULL;        \
+#define FREE_REPLY(x)       \
+    if (x)                  \
+    {                       \
+        freeReplyObject(x); \
+        x = NULL;           \
     }
 
 #define stringEQUALS(src, cmp) ((src) && (cmp) && !strcmp(src, cmp))
@@ -31,9 +32,19 @@ typedef struct redis_dataspace
 static redis_server _redis_server_ = {NULL, 0, NULL, 0};
 static redis_dataspace *_redis_ds_list = NULL;
 
-static pthread_mutex_t redis_mutex = PTHREAD_MUTEX_INITIALIZER;
+// static pthread_mutex_t redis_mutex = PTHREAD_MUTEX_INITIALIZER;
 
-static char *aprint(char *format, va_list ap)
+static char *aprint(char *format, ...)
+{
+    char *buff = NULL;
+    va_list ap;
+    va_start(ap, format);
+    vasprintf(&buff, format, ap);
+    va_end(ap);
+    return buff;
+}
+
+static char *vaprint(char *format, va_list ap)
 {
     char *buff = NULL;
     vasprintf(&buff, format, ap);
@@ -55,7 +66,7 @@ static long long redis_ttl(redis_dataspace *dataspace, char *key);
 static long long redis_expire(redis_dataspace *dataspace, char *key, long long expire);
 
 static struct redisContext *redis_connect(char *rhost, int rport, char *rauth, int timeout, int base);
-static void redis_disconnect(struct redisContext *redis);
+static struct redisContext *redis_disconnect(struct redisContext *redis);
 static int redis_auth(struct redisContext *redis, char *rauth);
 static int redis_select(struct redisContext *redis, int base);
 static redisReply *redis_command(redis_dataspace *dataspace, char *format, ...);
@@ -102,7 +113,7 @@ static redis_dataspace *redisDS_free(redis_dataspace *dataspace)
         FREE_AND_NULL(dataspace->name);
         dataspace->base = 0;
         FREE_AND_NULL(dataspace->prefix);
-        dataspace->context = NULL;
+        // dataspace->context = NULL;
         free(dataspace);
     }
     return next;
@@ -122,7 +133,7 @@ void redisDS_serverClose()
 
     for (redis_dataspace *ptr = _redis_ds_list; ptr; ptr = redisDS_free(ptr))
     {
-        redis_disconnect(ptr->context);
+        ptr->context = redis_disconnect(ptr->context);
     }
 }
 
@@ -142,7 +153,8 @@ static redis_dataspace *redisDS_object(char *name, int base, char *prefix)
         dataspace->name = strdup(name);
         dataspace->prefix = prefix;
         dataspace->base = base;
-        dataspace->context = NULL;
+        // dataspace->context = NULL;
+        dataspace->context = redis_connect(_redis_server_.host, _redis_server_.port, _redis_server_.auth, _redis_server_.timeout, base);
         dataspace->next = NULL;
         return dataspace;
     }
@@ -164,7 +176,7 @@ int redisDS_register(char *name, int base, char *prefix, ...)
     {
         va_list ap;
         va_start(ap, prefix);
-        redis_dataspace *object = redisDS_object(name, base, prefix ? aprint(prefix, ap) : NULL);
+        redis_dataspace *object = redisDS_object(name, base, prefix ? vaprint(prefix, ap) : NULL);
         va_end(ap);
 
         if (object)
@@ -215,7 +227,7 @@ static char *redis_type(redis_dataspace *dataspace, char *key)
     {
         ret = reply ? strdup(reply->str) : NULL;
     }
-    freeReplyObject(reply);
+    FREE_REPLY(reply);
 
     return ret;
 }
@@ -233,7 +245,7 @@ static cJSON *redis_string(redis_dataspace *dataspace, char *key)
     {
         json = cJSON_CreateNumber((double)reply->integer);
     }
-    freeReplyObject(reply);
+    FREE_REPLY(reply);
 
     return json;
 }
@@ -253,7 +265,7 @@ static cJSON *redis_hash(redis_dataspace *dataspace, char *key)
             cJSON_AddStringToObject(json, field, value);
         }
     }
-    freeReplyObject(reply);
+    FREE_REPLY(reply);
 
     return json;
 }
@@ -280,7 +292,7 @@ static cJSON *redis_list(redis_dataspace *dataspace, char *key)
             cJSON_AddStringToArray(json, reply->element[i]->str);
         }
     }
-    freeReplyObject(reply);
+    FREE_REPLY(reply);
 
     return json;
 }
@@ -305,7 +317,7 @@ static cJSON *redis_set(redis_dataspace *dataspace, char *key)
             cJSON_AddStringToArray(json, reply->element[i]->str);
         }
     }
-    freeReplyObject(reply);
+    FREE_REPLY(reply);
 
     return json;
 }
@@ -327,8 +339,10 @@ cJSON *redisDS_read(char *name, char *key, ...)
 
         va_list ap;
         va_start(ap, key);
-        char *fullkey = aprint(key, ap);
+        char *basekey = vaprint(key, ap);
         va_end(ap);
+        char *fullkey = aprint("%s%s", dataspace->prefix ? dataspace->prefix : "", basekey);
+        FREE_AND_NULL(basekey);
 
         char *type = redis_type(dataspace, fullkey);
         if (type)
@@ -368,7 +382,7 @@ static long long redis_ttl(redis_dataspace *dataspace, char *key)
     {
         ret = reply->integer;
     }
-    freeReplyObject(reply);
+    FREE_REPLY(reply);
 
     return ret;
 }
@@ -381,7 +395,7 @@ static long long redis_expire(redis_dataspace *dataspace, char *key, long long e
     {
         redisReply *reply = redis_command(dataspace, "EXPIRE %s %lld", key, expire);
         ret = REDIS_IS_OK(reply);
-        freeReplyObject(reply);
+        FREE_REPLY(reply);
     }
 
     return ret ? expire : oldttl;
@@ -406,17 +420,20 @@ long long redisDS_set(char *name, char *key, char *value, long long ttl, ...)
     {
         va_list ap;
         va_start(ap, ttl);
-        char *fullkey = aprint(key, ap);
-        char *fullval = aprint(value, ap);
+        char *basekey = vaprint(key, ap);
+        char *fullval = vaprint(value, ap);
         va_end(ap);
+        char *fullkey = aprint("%s%s", dataspace->prefix ? dataspace->prefix : "", basekey);
+        FREE_AND_NULL(basekey);
 
         long long newttl = 0;
-        redisReply *reply = redis_command(dataspace, "SET %s %s EX %lld", fullkey, fullval, ttl);
+        redisReply *reply = redis_command(dataspace, "SET %s %s", fullkey, fullval);
+        syslog(LOG_INFO, "SET %s %s = %d", fullkey, fullval, reply->type);
         if (REDIS_IS_OK(reply))
         {
             newttl = redis_expire(dataspace, fullkey, ttl);
         }
-        freeReplyObject(reply);
+        FREE_REPLY(reply);
 
         FREE_AND_NULL(fullval);
         FREE_AND_NULL(fullkey);
@@ -446,16 +463,18 @@ long long redisDS_append(char *name, char *key, char *value, long long ttl, ...)
 
         va_list ap;
         va_start(ap, ttl);
-        char *fullkey = aprint(key, ap);
-        char *fullval = aprint(value, ap);
+        char *basekey = vaprint(key, ap);
+        char *fullval = vaprint(value, ap);
         va_end(ap);
+        char *fullkey = aprint("%s%s", dataspace->prefix ? dataspace->prefix : "", basekey);
+        FREE_AND_NULL(basekey);
 
         redisReply *reply = redis_command(dataspace, "SADD %s %s", fullkey, fullval);
         if (REDIS_IS_OK(reply))
         {
             redis_expire(dataspace, fullkey, ttl);
         }
-        freeReplyObject(reply);
+        FREE_REPLY(reply);
 
         reply = redis_command(dataspace, "SCARD %s", fullkey);
         if (REDIS_IS_INT(reply))
@@ -491,8 +510,10 @@ long long redisDS_increment(char *name, char *key, int value, long long ttl, ...
 
         va_list ap;
         va_start(ap, ttl);
-        char *fullkey = aprint(key, ap);
+        char *basekey = vaprint(key, ap);
         va_end(ap);
+        char *fullkey = aprint("%s%s", dataspace->prefix ? dataspace->prefix : "", basekey);
+        FREE_AND_NULL(basekey);
 
         redisReply *reply = redis_command(dataspace, "INCRBY %s %d", fullkey, value);
         if (REDIS_IS_OK(reply) && REDIS_IS_INT(reply))
@@ -500,7 +521,7 @@ long long redisDS_increment(char *name, char *key, int value, long long ttl, ...
             count = reply->integer;
             redis_expire(dataspace, fullkey, ttl);
         }
-        freeReplyObject(reply);
+        FREE_REPLY(reply);
 
         FREE_AND_NULL(fullkey);
 
@@ -524,60 +545,51 @@ static long long redisDS_write(redis_dataspace *dataspace, char *key, cJSON *val
 {
     long long count = 0;
 
-    va_list ap;
-    va_start(ap, ttl);
-    char *fullkey = aprint(key, ap);
-    va_end(ap);
-
-    redisReply *reply = NULL;
-    cJSON *element = NULL;
-    if (value)
+    if (dataspace)
     {
-        switch (value->type)
-        {
-        case cJSON_String:
-            reply = redis_command(dataspace, "SET %s %s", fullkey, value->valuestring);
-            if (REDIS_IS_OK(reply))
-            {
-                count++;
-                redis_expire(dataspace, fullkey, ttl);
-            }
-            break;
-        case cJSON_Array:
-            cJSON_ArrayForEach(element, value)
-            {
-                reply = redis_command(dataspace, "SADD %s %s", fullkey, value->valuestring);
-                if (!REDIS_IS_OK(reply))
-                {
-                    break;
-                }
-                count++;
-            }
-            if (REDIS_IS_OK(reply))
-            {
-                redis_expire(dataspace, fullkey, ttl);
-            }
-            break;
-        case cJSON_Object:
-            cJSON_ArrayForEach(element, value)
-            {
-                reply = redis_command(dataspace, "HSET %s %s %s", fullkey, value->string, value->valuestring);
-                if (!REDIS_IS_OK(reply))
-                {
-                    break;
-                }
-                count++;
-            }
-            if (REDIS_IS_OK(reply))
-            {
-                redis_expire(dataspace, fullkey, ttl);
-            }
-            break;
-        }
-    }
-    freeReplyObject(reply);
-    FREE_AND_NULL(fullkey);
+        va_list ap;
+        va_start(ap, ttl);
+        char *basekey = vaprint(key, ap);
+        va_end(ap);
+        char *fullkey = aprint("%s%s", dataspace->prefix ? dataspace->prefix : "", basekey);
+        FREE_AND_NULL(basekey);
 
+        redisReply *reply = NULL;
+        cJSON *element = NULL;
+        if (value)
+        {
+            switch (value->type)
+            {
+            case cJSON_String:
+                reply = redis_command(dataspace, "SET %s %s", fullkey, value->valuestring);
+                syslog(LOG_DEBUG, "SET %s %s = %d", fullkey, value->valuestring, reply ? reply->type : -1);
+                redis_expire(dataspace, fullkey, ttl);
+                FREE_REPLY(reply);
+                count++;
+                break;
+            case cJSON_Array:
+                cJSON_ArrayForEach(element, value)
+                {
+                    reply = redis_command(dataspace, "SADD %s %s", fullkey, element->valuestring);
+                    FREE_REPLY(reply);
+                }
+                redis_expire(dataspace, fullkey, ttl);
+                count++;
+                break;
+            case cJSON_Object:
+                cJSON_ArrayForEach(element, value)
+                {
+                    reply = redis_command(dataspace, "HSET %s %s %s", fullkey, element->string, element->valuestring);
+                    FREE_REPLY(reply);
+                }
+                redis_expire(dataspace, fullkey, ttl);
+                count++;
+                break;
+            }
+        }
+        FREE_REPLY(reply);
+        FREE_AND_NULL(fullkey);
+    }
     return count;
 }
 
@@ -635,11 +647,16 @@ char *redisDS_version()
  **/
 static struct redisContext *redis_connect(char *rhost, int rport, char *rauth, int timeout, int base)
 {
-    struct redisContext *redis = NULL;
-    redis_disconnect(redis);
-    struct timeval tv = {timeout / 1000, (timeout % 1000) * 1000};
+    syslog(LOG_DEBUG, "CONNECT ('%s', %d, '%s', %d, %d)",
+           rhost,
+           rport,
+           rauth ? rauth : "NULL",
+           timeout,
+           base);
+    // struct timeval tv = {timeout / 1000, (timeout % 1000) * 1000};
 
-    redis = redisConnectWithTimeout(rhost, rport, tv);
+    // struct redisContext *redis = redisConnectWithTimeout(rhost, rport, tv);
+    struct redisContext *redis = redisConnect(rhost, rport);
     if (redis                                                 // connected
         && !redis->err                                        // not error
         && (!(rauth && rauth[0]) || redis_auth(redis, rauth)) // auth
@@ -656,12 +673,13 @@ static struct redisContext *redis_connect(char *rhost, int rport, char *rauth, i
  *
  * @param struct redisContext
  **/
-static void redis_disconnect(struct redisContext *redis)
+static struct redisContext *redis_disconnect(struct redisContext *redis)
 {
     if (redis)
     {
         redisFree(redis);
     }
+    return NULL;
 }
 
 /**
@@ -683,7 +701,7 @@ static int redis_auth(struct redisContext *redis, char *rauth)
         ret = REDIS_IS_OK(reply);
     }
 
-    freeReplyObject(reply);
+    FREE_REPLY(reply);
     return ret;
 }
 
@@ -706,7 +724,7 @@ static int redis_select(struct redisContext *redis, int base)
         ret = REDIS_IS_OK(reply);
     }
 
-    freeReplyObject(reply);
+    FREE_REPLY(reply);
     return ret;
 }
 
@@ -728,7 +746,7 @@ static redisReply *redis_command(redis_dataspace *dataspace, char *format, ...)
 }
 
 /**
- * Execute the REDIS command (thread safe)
+ * Execute the REDIS command
  *
  * @param redis REDIS subject
  * @param format
@@ -736,35 +754,39 @@ static redisReply *redis_command(redis_dataspace *dataspace, char *format, ...)
  **/
 static redisReply *redis_vcommand(redis_dataspace *dataspace, char *format, va_list ap)
 {
-    redisReply *reply = NULL;
-    redisContext *cx = dataspace->context;
-    // on first connection
-    if (!cx)
+    // redisContext *cx = dataspace->context;
+
+    // on first/lost connection
+    if (!dataspace->context)
     {
-        cx = redis_connect(_redis_server_.host, _redis_server_.port, _redis_server_.auth, _redis_server_.timeout, dataspace->base);
+        dataspace->context = redis_connect(_redis_server_.host, _redis_server_.port, _redis_server_.auth, _redis_server_.timeout, dataspace->base);
     }
 
     /** Lock redis **/
-    pthread_mutex_lock(&redis_mutex);
+    // pthread_mutex_lock(&redis_mutex);
     // try
-    if (cx)
+    redisReply *reply = NULL;
+    if (dataspace->context)
     {
         va_list ap0;
         va_copy(ap0, ap);
-        reply = redisvCommand(cx, format, ap0);
+        reply = redisvCommand(dataspace->context, format, ap0);
+        syslog(LOG_DEBUG, "COMMAND (%s) = %d('%s')", format, reply->type, reply->str);
         va_end(ap0);
     }
 
     // retry after reconnect
-    if ((NULL == reply) && (cx = redis_connect(_redis_server_.host, _redis_server_.port, _redis_server_.auth, _redis_server_.timeout, dataspace->base)))
+    if ((NULL == reply) && (dataspace->context = redis_connect(_redis_server_.host, _redis_server_.port, _redis_server_.auth, _redis_server_.timeout, dataspace->base)))
     {
+        syslog(LOG_DEBUG, "SECOND try");
+
         va_list ap1;
         va_copy(ap1, ap);
 
-        reply = redisvCommand(cx, format, ap1);
+        reply = redisvCommand(dataspace->context, format, ap1);
         va_end(ap1);
     }
-    pthread_mutex_unlock(&redis_mutex);
+    // pthread_mutex_unlock(&redis_mutex);
     /** Unlock redis **/
 
     return reply;
