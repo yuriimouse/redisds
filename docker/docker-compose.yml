@@ -18,6 +18,8 @@ services:
     build: .
     volumes:
       - ../:/redisds
+    networks:
+      - app-tier
     entrypoint: /bin/bash
     stdin_open: true
     tty: true
