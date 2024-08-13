@@ -21,14 +21,6 @@
         x = NULL;        \
     }
 
-typedef struct redis_server
-{
-    char *host;
-    int port;
-    char *auth;
-    int timeout;
-} redis_server;
-
 int redisDS_serverOpen(char *host,
                        int port,
                        char *auth,

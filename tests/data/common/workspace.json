@@ -1,9 +1,0 @@
-{
-    "some": "scalar",
-    "set": ["first", "second", "third"],
-    "hash": {
-        "a":"aaaa",
-        "b":"bbbbbbb",
-        "c":"ccccc"
-    }
-}

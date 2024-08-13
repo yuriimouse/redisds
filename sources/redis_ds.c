@@ -19,6 +19,14 @@
 #define REDIS_IS_STRING(x) (x && (REDIS_REPLY_STRING == x->type))
 #define REDIS_IS_ARRAY(x) (x && (REDIS_REPLY_ARRAY == x->type))
 
+typedef struct redis_server
+{
+    char *host;
+    int port;
+    char *auth;
+    int timeout;
+} redis_server;
+
 typedef struct redis_dataspace
 {
     char *name;
@@ -32,18 +40,6 @@ typedef struct redis_dataspace
 static redis_server _redis_server_ = {NULL, 0, NULL, 0};
 static redis_dataspace *_redis_ds_list = NULL;
 
-// static pthread_mutex_t redis_mutex = PTHREAD_MUTEX_INITIALIZER;
-
-static char *aprint(char *format, ...)
-{
-    char *buff = NULL;
-    va_list ap;
-    va_start(ap, format);
-    vasprintf(&buff, format, ap);
-    va_end(ap);
-    return buff;
-}
-
 static char *vaprint(char *format, va_list ap)
 {
     char *buff = NULL;
@@ -51,7 +47,15 @@ static char *vaprint(char *format, va_list ap)
     return buff;
 }
 
-static redis_dataspace *redisDS_object(char *name, int base, char *prefix);
+static char *aprint(char *format, ...)
+{
+    va_list ap;
+    va_start(ap, format);
+    char *buff = vaprint(format, ap);
+    va_end(ap);
+    return buff;
+}
+
 static redis_dataspace *redisDS_free(redis_dataspace *dataspace);
 static redis_dataspace *redisDS_object(char *name, int base, char *prefix);
 static redis_dataspace *redisDS_get(char *name);
@@ -135,6 +139,7 @@ void redisDS_serverClose()
     {
         ptr->context = redis_disconnect(ptr->context);
     }
+    _redis_ds_list = NULL;
 }
 
 /**
@@ -428,7 +433,7 @@ long long redisDS_set(char *name, char *key, char *value, long long ttl, ...)
 
         long long newttl = 0;
         redisReply *reply = redis_command(dataspace, "SET %s %s", fullkey, fullval);
-        syslog(LOG_INFO, "SET %s %s = %d", fullkey, fullval, reply->type);
+        syslog(LOG_DEBUG, "redisDS: SET %s %s = %d", fullkey, fullval, reply->type);
         if (REDIS_IS_OK(reply))
         {
             newttl = redis_expire(dataspace, fullkey, ttl);
@@ -562,7 +567,7 @@ static long long redisDS_write(redis_dataspace *dataspace, char *key, cJSON *val
             {
             case cJSON_String:
                 reply = redis_command(dataspace, "SET %s %s", fullkey, value->valuestring);
-                syslog(LOG_DEBUG, "SET %s %s = %d", fullkey, value->valuestring, reply ? reply->type : -1);
+                syslog(LOG_DEBUG, "redisDS: SET %s %s = %d", fullkey, value->valuestring, reply ? reply->type : -1);
                 redis_expire(dataspace, fullkey, ttl);
                 FREE_REPLY(reply);
                 count++;
@@ -647,7 +652,7 @@ char *redisDS_version()
  **/
 static struct redisContext *redis_connect(char *rhost, int rport, char *rauth, int timeout, int base)
 {
-    syslog(LOG_DEBUG, "CONNECT ('%s', %d, '%s', %d, %d)",
+    syslog(LOG_DEBUG, "redisDS: CONNECT ('%s', %d, '%s', %d, %d)",
            rhost,
            rport,
            rauth ? rauth : "NULL",
@@ -754,16 +759,12 @@ static redisReply *redis_command(redis_dataspace *dataspace, char *format, ...)
  **/
 static redisReply *redis_vcommand(redis_dataspace *dataspace, char *format, va_list ap)
 {
-    // redisContext *cx = dataspace->context;
-
     // on first/lost connection
     if (!dataspace->context)
     {
         dataspace->context = redis_connect(_redis_server_.host, _redis_server_.port, _redis_server_.auth, _redis_server_.timeout, dataspace->base);
     }
 
-    /** Lock redis **/
-    // pthread_mutex_lock(&redis_mutex);
     // try
     redisReply *reply = NULL;
     if (dataspace->context)
@@ -771,23 +772,19 @@ static redisReply *redis_vcommand(redis_dataspace *dataspace, char *format, va_l
         va_list ap0;
         va_copy(ap0, ap);
         reply = redisvCommand(dataspace->context, format, ap0);
-        syslog(LOG_DEBUG, "COMMAND (%s) = %d('%s')", format, reply->type, reply->str);
+        syslog(LOG_DEBUG, "redisDS: COMMAND (%s) = %d('%s')", format, reply->type, reply->str);
         va_end(ap0);
     }
 
     // retry after reconnect
     if ((NULL == reply) && (dataspace->context = redis_connect(_redis_server_.host, _redis_server_.port, _redis_server_.auth, _redis_server_.timeout, dataspace->base)))
     {
-        syslog(LOG_DEBUG, "SECOND try");
-
         va_list ap1;
         va_copy(ap1, ap);
-
         reply = redisvCommand(dataspace->context, format, ap1);
+        syslog(LOG_DEBUG, "redisDS: SECOND try (%s) = %d('%s')", format, reply->type, reply->str);
         va_end(ap1);
     }
-    // pthread_mutex_unlock(&redis_mutex);
-    /** Unlock redis **/
 
     return reply;
 }
